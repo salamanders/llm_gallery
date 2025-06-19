@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU Advanced Compute Demo</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background-color: #0f172a; /* Slate 900 */
+            font-family: "Inter", sans-serif;
+            color: #e2e8f0; /* Slate 200 */
+        }
+        canvas {
+            display: block;
+            border-radius: 1rem; /* rounded-2xl */
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05); /* shadow-xl */
+            background-color: #1e293b; /* Slate 800 */
+        }
+        #info-box {
+            position: absolute;
+            top: 1rem;
+            left: 1rem;
+            padding: 0.75rem 1.25rem; /* py-3 px-5 */
+            background-color: rgba(30, 41, 59, 0.8); /* Slate 800 with transparency */
+            border-radius: 0.5rem; /* rounded-lg */
+            color: #e2e8f0; /* Slate 200 */
+            font-size: 0.875rem; /* text-sm */
+            z-index: 10;
+            backdrop-filter: blur(5px);
+            border: 1px solid #334155; /* Slate 700 */
+        }
+    </style>
+</head>
+<body>
+    <div id="info-box" class="flex flex-col gap-1">
+        <p><strong>WebGPU Compute Shader Demo</strong></p>
+        <p>Particles: <span id="particle-count"></span></p>
+        <p>FPS: <span id="fps-display">--</span></p>
+        <p>Move mouse to attract/repel particles!</p>
+    </div>
+    <canvas id="gpuCanvas"></canvas>
+
+    <script type="module">
+        const canvas = document.getElementById('gpuCanvas');
+        const particleCountSpan = document.getElementById('particle-count');
+        const fpsDisplay = document.getElementById('fps-display');
+
+        let device;
+        let context;
+        let particleBuffer1; // Storage buffer for current particle state
+        let particleBuffer2; // Storage buffer for next particle state (for ping-ponging)
+        let uniformBuffer;   // Uniform buffer for mouse position and delta time
+        let computePipeline; // Pipeline for compute shader
+        let renderPipeline;  // Pipeline for rendering particles
+        let computeBindGroup1; // Bind group for compute pass (reads from buffer1, writes to buffer2)
+        let computeBindGroup2; // Bind group for compute pass (reads from buffer2, writes to buffer1)
+        let renderBindGroup;   // Bind group for render pass (reads from the buffer updated by compute)
+
+        // Number of particles to simulate and render
+        const PARTICLE_COUNT = 250_000;
+        // Size of each particle's data in the buffer: position (vec2), velocity (vec2)
+        // Each vec2 is 2 floats, so 4 floats total.
+        const PARTICLE_BYTE_SIZE = 4 * Float32Array.BYTES_PER_ELEMENT; // 4 floats * 4 bytes/float = 16 bytes
+        // Workgroup size for the compute shader. Optimal values depend on GPU, 256 is common.
+        const WORKGROUP_SIZE = 256;
+
+        let mouseX = 0.5; // Normalized mouse X position [0, 1]
+        let mouseY = 0.5; // Normalized mouse Y position [0, 1]
+        let lastTime = 0; // Last frame timestamp for delta time calculation
+        let frameCount = 0; // Frame counter for FPS calculation
+        let fps = 0;        // Frames per second
+
+        // Size of the uniform buffer in bytes: mouseX, mouseY, deltaTime, totalTime
+        // Each is a float (4 bytes). Total 4 floats * 4 bytes/float = 16 bytes.
+        const uniformBufferSize = 4 * Float32Array.BYTES_PER_ELEMENT;
+
+        /**
+         * Initializes WebGPU, sets up the canvas, creates buffers, shaders, and pipelines.
+         */
+        async function initWebGPU() {
+            // Check if WebGPU is supported by the browser
+            if (!navigator.gpu) {
+                document.body.innerHTML = `
+                    <div class="p-8 bg-red-900 text-white rounded-lg shadow-xl">
+                        <h1 class="text-2xl font-bold mb-4">WebGPU Not Supported</h1>
+                        <p>Your browser does not support WebGPU. Please use a
+                        <a href="https://caniuse.com/webgpu" class="underline text-red-300 hover:text-red-100" target="_blank">
+                        modern version of Chrome or Edge.</a></p>
+                    </div>`;
+                return;
+            }
+
+            // Request a GPU adapter (physical GPU)
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) {
+                console.error('No WebGPU adapter found. Ensure your GPU drivers are up-to-date.');
+                return;
+            }
+
+            // Request a GPU device (logical device for operations)
+            device = await adapter.requestDevice();
+            if (!device) {
+                console.error('No WebGPU device found.');
+                return;
+            }
+
+            // Get the WebGPU context from the canvas element
+            context = canvas.getContext('webgpu');
+            // Determine the best texture format for the canvas based on the browser/GPU
+            const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+
+            // Configure the WebGPU context
+            context.configure({
+                device: device,
+                format: presentationFormat,
+                alphaMode: 'premultiplied', // Allows for transparency and blending
+            });
+
+            // Function to resize the canvas to fit the window and reconfigure the context
+            function resizeCanvas() {
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerHeight;
+                // Reconfigure context with new size for proper rendering
+                context.configure({
+                    device: device,
+                    format: presentationFormat,
+                    alphaMode: 'premultiplied',
+                    size: [canvas.width, canvas.height],
+                });
+            }
+            window.addEventListener('resize', resizeCanvas);
+            resizeCanvas(); // Initial call to set canvas size
+
+            // --- Create GPU Buffers ---
+
+            // Create two storage buffers for particle data (position, velocity).
+            // STORAGE usage is crucial for compute shaders to read/write to them.
+            // COPY_DST allows us to write initial data from the CPU to the GPU buffer.
+            particleBuffer1 = device.createBuffer({
+                size: PARTICLE_COUNT * PARTICLE_BYTE_SIZE,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            particleBuffer2 = device.createBuffer({
+                size: PARTICLE_COUNT * PARTICLE_BYTE_SIZE,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+
+            // Initialize particle data on the CPU
+            const initialParticleData = new Float32Array(PARTICLE_COUNT * (PARTICLE_BYTE_SIZE / Float32Array.BYTES_PER_ELEMENT)); // 4 floats per particle
+            for (let i = 0; i < PARTICLE_COUNT; ++i) {
+                // Initial position (x, y) randomized across the canvas [0, 1]
+                initialParticleData[i * 4 + 0] = Math.random(); // x
+                initialParticleData[i * 4 + 1] = Math.random(); // y
+
+                // Initial velocity (vx, vy) small random values
+                initialParticleData[i * 4 + 2] = (Math.random() - 0.5) * 0.0001; // vx
+                initialParticleData[i * 4 + 3] = (Math.random() - 0.5) * 0.0001; // vy
+            }
+            // Copy initial data to the first particle buffer on the GPU
+            device.queue.writeBuffer(particleBuffer1, 0, initialParticleData);
+
+            // Create a uniform buffer for passing global data (mouse position, delta time, total time)
+            // UNIFORM usage means it's read-only in shaders, COPY_DST allows CPU writes.
+            uniformBuffer = device.createBuffer({
+                size: uniformBufferSize,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+
+            // --- Create WGSL Shaders ---
+
+            // WebGPU Shading Language (WGSL) code for the compute shader
+            // This shader updates the position and velocity of each particle.
+            const computeShaderCode = `
+                // Structure defining a single particle's data
+                struct Particle {
+                    position: vec2<f32>,
+                    velocity: vec2<f32>,
+                };
+
+                // Bindings for the compute shader:
+                // @group(0) @binding(0): Input buffer for current particle states (read-only storage)
+                @group(0) @binding(0) var<storage, read> particlesIn: array<Particle>;
+                // @group(0) @binding(1): Output buffer for next particle states (write-only storage)
+                @group(0) @binding(1) var<storage, write> particlesOut: array<Particle>;
+                // @group(0) @binding(2): Uniform buffer for global parameters (read-only uniform)
+                @group(0) @binding(2) var<uniform> uniforms: struct {
+                    mouseX: f32,
+                    mouseY: f32,
+                    deltaTime: f32,
+                    time: f32,
+                };
+
+                // Main entry point for the compute shader.
+                // @builtin(global_invocation_id) gives a unique ID for each shader invocation.
+                // @workgroup_size defines how many invocations are in a single workgroup.
+                @compute @workgroup_size(${WORKGROUP_SIZE})
+                fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+                    let p_idx = global_id.x; // Particle index from global invocation ID
+
+                    // Return if the particle index is out of bounds (e.g., if total particles is not a multiple of workgroup size)
+                    if (p_idx >= arrayLength(&particlesIn)) {
+                        return;
+                    }
+
+                    var particle = particlesIn[p_idx]; // Get current particle state
+
+                    let mouse_pos = vec2<f32>(uniforms.mouseX, uniforms.mouseY); // Mouse position from uniform
+                    let particle_pos = particle.position; // Particle's current position
+
+                    // Calculate direction and squared distance to the mouse
+                    let dir_to_mouse = mouse_pos - particle_pos;
+                    let dist_sq = dot(dir_to_mouse, dir_to_mouse);
+                    let dist = sqrt(dist_sq);
+
+                    // Force calculation: attraction/repulsion based on mouse distance
+                    let force_strength = 0.0000005; // Base strength of the mouse interaction
+                    let min_dist = 0.05; // Minimum distance to prevent extreme forces near the mouse
+                    let max_dist = 0.5;  // Maximum distance for the mouse influence to be significant
+
+                    var attraction_force = vec2<f32>(0.0, 0.0);
+                    if (dist > 0.001) { // Avoid division by zero when particle is exactly at mouse
+                        let clamped_dist = clamp(dist, min_dist, max_dist); // Clamp distance
+                        let force_magnitude = force_strength / clamped_dist; // Inverse distance force model
+                        attraction_force = normalize(dir_to_mouse) * force_magnitude; // Direction * magnitude
+                    }
+
+                    // Add some subtle noise/random walk for more organic movement
+                    // Using time and particle index for pseudo-randomness
+                    let noise_strength = 0.000001;
+                    let noise_offset = vec2<f32>(
+                        sin(uniforms.time * 5.0 + f32(p_idx) * 0.1),
+                        cos(uniforms.time * 5.0 + f32(p_idx) * 0.1)
+                    ) * noise_strength;
+
+                    // Update velocity: apply attraction force and noise
+                    particle.velocity += attraction_force * uniforms.deltaTime;
+                    particle.velocity += noise_offset * uniforms.deltaTime;
+
+                    // Apply damping (friction) to gradually slow down particles
+                    particle.velocity *= 0.995;
+
+                    // Update position based on velocity and delta time
+                    particle.position += particle.velocity * uniforms.deltaTime;
+
+                    // Wrap around boundaries: if particle goes off one edge, it appears on the opposite
+                    if (particle.position.x < 0.0) { particle.position.x += 1.0; }
+                    if (particle.position.x > 1.0) { particle.position.x -= 1.0; }
+                    if (particle.position.y < 0.0) { particle.position.y += 1.0; }
+                    if (particle.position.y > 1.0) { particle.position.y -= 1.0; }
+
+                    // Write the updated particle state to the output buffer
+                    particlesOut[p_idx] = particle;
+                }
+            `;
+            const computeShaderModule = device.createShaderModule({
+                code: computeShaderCode,
+            });
+
+            // WGSL code for the render shader
+            // This shader draws each particle as a colored point.
+            const renderShaderCode = `
+                // Structure defining a single particle's data, same as in compute shader
+                struct Particle {
+                    position: vec2<f32>,
+                    velocity: vec2<f32>,
+                };
+
+                // @group(0) @binding(0): Input buffer for particle states (read-only storage)
+                @group(0) @binding(0) var<storage, read> particles: array<Particle>;
+
+                // Output structure for the vertex shader
+                struct VertexOutput {
+                    @builtin(position) position: vec4<f32>, // Clip space position
+                    @location(0) color: vec4<f32>,         // Color passed to fragment shader
+                };
+
+                // Vertex Shader: executed once per particle (vertex)
+                @vertex
+                fn vs_main(@builtin(vertex_index) vertexIndex : u32) -> VertexOutput {
+                    // Get particle data from the storage buffer using the vertex index
+                    let particle = particles[vertexIndex];
+
+                    // Convert normalized [0,1] particle position to clip space [-1,1]
+                    // Y-axis is flipped because WebGPU's clip space Y is typically up, while canvas Y is down.
+                    let clip_pos = vec2<f32>(
+                        particle.position.x * 2.0 - 1.0,
+                        (1.0 - particle.position.y) * 2.0 - 1.0
+                    );
+
+                    var output: VertexOutput;
+                    // Set the output position (Z=0, W=1 for 2D rendering)
+                    output.position = vec4<f32>(clip_pos, 0.0, 1.0);
+
+                    // Assign a color based on particle speed (velocity magnitude)
+                    let speed = length(particle.velocity);
+                    // Mix between a blue (low speed) and yellow (high speed) color
+                    output.color = mix(vec4<f32>(0.2, 0.7, 1.0, 1.0), vec4<f32>(1.0, 0.9, 0.2, 1.0), min(speed * 1000.0, 1.0));
+                    output.color.a = 0.8; // Set a fixed alpha for slight transparency
+                    return output;
+                }
+
+                // Fragment Shader: executed for each pixel covered by a point
+                @fragment
+                fn fs_main(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> {
+                    // For a point list primitive, simply output the interpolated color.
+                    // The clear color's alpha will create the trail effect.
+                    return color;
+                }
+            `;
+            const renderShaderModule = device.createShaderModule({
+                code: renderShaderCode,
+            });
+
+            // --- Create Pipelines ---
+
+            // Create the compute pipeline: defines the compute shader and its execution
+            computePipeline = device.createComputePipeline({
+                layout: 'auto', // Automatically generate the bind group layout based on shader bindings
+                compute: {
+                    module: computeShaderModule,
+                    entryPoint: 'main', // Entry point function in the compute shader
+                },
+            });
+
+            // Create the render pipeline: defines how geometry is rendered
+            renderPipeline = device.createRenderPipeline({
+                layout: 'auto', // Automatically generate the bind group layout
+                vertex: {
+                    module: renderShaderModule,
+                    entryPoint: 'vs_main', // Entry point function for the vertex shader
+                },
+                fragment: {
+                    module: renderShaderModule,
+                    entryPoint: 'fs_main', // Entry point function for the fragment shader
+                    targets: [{ format: presentationFormat }], // Output format of the render target (canvas)
+                },
+                primitive: {
+                    topology: 'point-list', // Render each vertex as an individual point
+                },
+            });
+
+            // --- Create Bind Groups ---
+
+            // Bind groups link shader resources (buffers, textures) to pipeline layouts.
+            // These are for the compute pipeline, used for ping-ponging:
+            // computeBindGroup1: reads from particleBuffer1, writes to particleBuffer2
+            computeBindGroup1 = device.createBindGroup({
+                layout: computePipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: particleBuffer1 } }, // particlesIn
+                    { binding: 1, resource: { buffer: particleBuffer2 } }, // particlesOut
+                    { binding: 2, resource: { buffer: uniformBuffer } },  // uniforms
+                ],
+            });
+            // computeBindGroup2: reads from particleBuffer2, writes to particleBuffer1
+            computeBindGroup2 = device.createBindGroup({
+                layout: computePipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: particleBuffer2 } }, // particlesIn
+                    { binding: 1, resource: { buffer: particleBuffer1 } }, // particlesOut
+                    { binding: 2, resource: { buffer: uniformBuffer } },  // uniforms
+                ],
+            });
+
+            // Initial render bind group (will be updated dynamically in animate loop)
+            // It initially points to particleBuffer1.
+            renderBindGroup = device.createBindGroup({
+                layout: renderPipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: particleBuffer1 } },
+                ],
+            });
+
+            // Add event listener for mouse movement to update mouse coordinates
+            canvas.addEventListener('mousemove', (event) => {
+                // Normalize mouse coordinates to [0, 1] range
+                mouseX = event.clientX / canvas.width;
+                mouseY = event.clientY / canvas.height;
+            });
+
+            // Display the total particle count in the info box
+            particleCountSpan.textContent = PARTICLE_COUNT.toLocaleString();
+
+            // Start the animation loop
+            requestAnimationFrame(animate);
+        }
+
+        let currentParticleBuffer = particleBuffer1; // Tracks the buffer containing the CURRENT particle states
+        let currentComputeBindGroup = computeBindGroup1; // Tracks the compute bind group to use for the current frame
+
+        /**
+         * The main animation loop.
+         * It updates particle states using the compute shader and then renders them to the canvas.
+         * @param {DOMHighResTimeStamp} time - The current time provided by requestAnimationFrame.
+         */
+        function animate(time) {
+            if (!device) return; // Exit if WebGPU device isn't initialized
+
+            // Calculate delta time (time elapsed since last frame) in seconds
+            const deltaTime = (time - lastTime) / 1000.0;
+            lastTime = time;
+
+            // --- FPS Calculation ---
+            frameCount++;
+            // Update FPS display roughly once every second
+            if (time >= lastTime + 1000) {
+                fps = frameCount;
+                frameCount = 0;
+                // Note: The `lastTime` for FPS calculation should be distinct from the `lastTime` for `deltaTime`
+                // Let's use `performance.now()` for this for consistency with `requestAnimationFrame`'s `time` argument.
+                fpsDisplay.textContent = fps;
+            }
+
+
+            // Update the uniform buffer with latest mouse position, delta time, and total elapsed time
+            const uniformData = new Float32Array([
+                mouseX,
+                mouseY,
+                deltaTime,
+                time / 1000.0 // Total time in seconds, useful for time-based animations/noise
+            ]);
+            device.queue.writeBuffer(uniformBuffer, 0, uniformData);
+
+            // --- Command Encoding ---
+            // Create a command encoder to record commands for the GPU
+            const commandEncoder = device.createCommandEncoder();
+
+            // --- Compute Pass ---
+            // Determine which buffer will be the output for this compute pass (ping-ponging)
+            const nextParticleBuffer = (currentParticleBuffer === particleBuffer1) ? particleBuffer2 : particleBuffer1;
+            // Determine which compute bind group to use (swaps input/output buffers)
+            const nextComputeBindGroup = (currentComputeBindGroup === computeBindGroup1) ? computeBindGroup2 : computeBindGroup1;
+
+            // Recreate the render bind group to point to the `nextParticleBuffer`.
+            // This is essential because the render pass must read from the buffer that the
+            // compute pass just finished writing to.
+            renderBindGroup = device.createBindGroup({
+                layout: renderPipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: nextParticleBuffer } }, // Render reads from the buffer that was just written to
+                ],
+            });
+
+            // Begin the compute pass
+            const computePass = commandEncoder.beginComputePass();
+            computePass.setPipeline(computePipeline);          // Set the compute pipeline
+            computePass.setBindGroup(0, nextComputeBindGroup); // Set the appropriate bind group
+            // Dispatch workgroups: each workgroup processes `WORKGROUP_SIZE` particles.
+            // Math.ceil ensures all particles are processed even if PARTICLE_COUNT is not a multiple.
+            computePass.dispatchWorkgroups(Math.ceil(PARTICLE_COUNT / WORKGROUP_SIZE));
+            computePass.end(); // End the compute pass
+
+            // Swap buffers for the next frame's computation
+            currentParticleBuffer = nextParticleBuffer;
+            currentComputeBindGroup = nextComputeBindGroup;
+
+
+            // --- Render Pass ---
+            // Define the render pass descriptor
+            const renderPassDescriptor = {
+                colorAttachments: [{
+                    view: context.getCurrentTexture().createView(), // Get the current texture from the canvas context
+                    // Clear value: a dark blue with low alpha for a subtle trail effect
+                    clearValue: { r: 0.05, g: 0.08, b: 0.1, a: 0.05 },
+                    loadOp: 'clear',  // Clear the color buffer before drawing
+                    storeOp: 'store', // Store the result to the texture
+                }],
+            };
+
+            // Begin the render pass
+            const renderPass = commandEncoder.beginRenderPass(renderPassDescriptor);
+            renderPass.setPipeline(renderPipeline);    // Set the render pipeline
+            renderPass.setBindGroup(0, renderBindGroup); // Set the bind group for rendering
+            renderPass.draw(PARTICLE_COUNT);           // Draw `PARTICLE_COUNT` vertices (each vertex represents a particle)
+            renderPass.end(); // End the render pass
+
+            // Finish encoding commands and submit them to the GPU queue for execution
+            device.queue.submit([commandEncoder.finish()]);
+
+            // Request the next animation frame to continue the loop
+            requestAnimationFrame(animate);
+        }
+
+        // Initialize WebGPU when the window has fully loaded
+        window.onload = initWebGPU;
+
+    </script>
+</body>
+</html>
