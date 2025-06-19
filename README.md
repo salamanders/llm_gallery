@@ -19,3 +19,4 @@ How well do modern small models perform in a single-shot task running on old har
 * [devstralQ4_0](devstralQ4_0.html)
 * [Ophiuchi-Qwen3-14B-Instruct.i1-Q4_K_M](Ophiuchi-Qwen3-14B-Instruct.i1-Q4_K_M.html): Lots of repeats in the thinking, but eventually produced a result.
 * [qwen2.5-coder-7b-instruct-q6_k](qwen2.5-coder-7b-instruct-q6_k.html)
+* [Qwen3-14B-NEO-Imatrix-Max-D_AU-IQ4_XS-imat](Qwen3-14B-NEO-Imatrix-Max-D_AU-IQ4_XS-imat.html)
