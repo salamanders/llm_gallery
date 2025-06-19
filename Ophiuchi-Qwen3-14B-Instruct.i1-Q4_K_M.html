@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGPU Ray Tracing Demo</title>
+  <style>
+    body {
+      margin: 0;
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+    }
+    canvas {
+      border: 1px solid #fff;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="webgpu-canvas" width="800" height="600"></canvas>
+  <script type="module">
+    async function init() {
+      const canvas = document.getElementById("webgpu-canvas");
+      if (!navigator.gpu) {
+        alert("WebGPU not supported. Enable with chrome://flags/#enable-unsafe-webgpu");
+        return;
+      }
+
+      const adapter = await navigator.gpu.requestAdapter();
+      const device = await adapter.requestDevice();
+
+      const context = canvas.getContext("webgpu");
+      const format = navigator.gpu.getPreferredCanvasFormat();
+      context.configure({
+        device: device,
+        format: format,
+        alphaMode: "opaque",
+      });
+
+      // Create a ray tracing pipeline (simplified for demo)
+      const pipeline = device.createRayTracingPipeline({
+        layout: "auto",
+        rayTracingShaderModules: {
+          miss: device.createShaderModule({
+            code: `
+              [[stage(miss)]] fn miss(ray: Ray) -> vec4<f32> {
+                return vec4<f32>(0.0, 0.0, 1.0, 1.0); // Background color
+              }
+            `,
+          }),
+          closestHit: device.createShaderModule({
+            code: `
+              [[stage(closest_hit)]] fn closestHit(hit: Hit) {
+                // Simple sphere intersection
+                let center = vec3<f32>(0.0, 0.0, -5.0);
+                let radius = 1.0;
+                let pos = hit.worldRayOrigin + hit.worldRayDirection * hit.t;
+                let dist = length(pos - center);
+                if (dist < radius) {
+                  // Reflect ray
+                  let normal = normalize(pos - center);
+                  let reflectDir = reflect(hit.worldRayDirection, normal);
+                  hit.color = vec3<f32>(1.0, 0.0, 0.0); // Sphere color
+                }
+              }
+            `,
+          }),
+        },
+      });
+
+      // Create a ray tracing acceleration structure (simplified)
+      const accelerationStructure = device.createAccelerationStructure({
+        type: "top_level",
+        instanceCount: 1,
+      });
+
+      // Launch ray tracing
+      const commandEncoder = device.createCommandEncoder();
+      const passEncoder = commandEncoder.beginRayTracingPass({
+        view: context.getCurrentTexture().createView(),
+        width: canvas.width,
+        height: canvas.height,
+        rayTracingPipeline: pipeline,
+        accelerationStructure: accelerationStructure,
+      });
+
+      passEncoder.dispatch(1, 1, 1); // Dispatch rays
+      passEncoder.end();
+
+      device.queue.submit([commandEncoder.finish()]);
+    }
+
+    init();
+  </script>
+</body>
+</html>
